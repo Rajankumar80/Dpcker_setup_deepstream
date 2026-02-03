@@ -1,0 +1,220 @@
+1️⃣ Running DeepStream Container with GPU, Display, and Volume Mount
+✅ Command used:
+xhost +local:root
+
+docker run -it --rm \
+  --gpus all \
+  --net=host \
+  --privileged \
+  -e DISPLAY=$DISPLAY \
+  -v /tmp/.X11-unix:/tmp/.X11-unix \
+  -v ~/retail_analytics:/app \
+  --name deepstream-retail \
+  deepstream-retail
+
+What each flag does:
+Flag	Purpose
+--gpus all	Gives container access to all GPUs
+--net=host	Required for camera & display
+--privileged	Allows webcam device access
+-e DISPLAY	Enables GUI rendering
+-v /tmp/.X11-unix	Shares X11 socket
+-v ~/retail_analytics:/app	Mounts project folder
+--name deepstream-retail	Container name
+2️⃣ Verifying GPU, Display, and Camera Inside Container
+🔍 Verify GPU:
+nvidia-smi
+
+
+Expected: GPU name and memory visible.
+
+🔍 Verify GStreamer:
+gst-launch-1.0 v4l2src device=/dev/video0 ! videoconvert ! nveglglessink
+
+
+Expected: Webcam window opens.
+
+🔍 Verify CUDA:
+nvcc --version
+
+3️⃣ Project Folder Structure (Volume Mounted)
+/app
+ ├── models/
+ │    ├── best.onnx
+ │    ├── best.engine
+ │    └── labels.txt
+ ├── parser/
+ │    ├── custom_yolo_parser.cpp
+ │    └── libnvdsinfer_custom_impl_Yolo.so
+ ├── configs/
+ │    └── config_infer_primary_yolo.txt
+ └── src/
+      └── deepstream_retail_analytics.py
+
+4️⃣ Custom Parser Logic
+
+The parser must match the model output format.
+
+If model output is:
+
+(5, 8400)
+
+
+or
+
+(1, 8400, 6)
+
+
+Parser must read accordingly.
+
+Example parser for raw YOLO output:
+extern "C" bool NvDsInferParseYolo(
+    std::vector<NvDsInferLayerInfo> const& outputLayersInfo,
+    NvDsInferNetworkInfo const&,
+    NvDsInferParseDetectionParams const& detectionParams,
+    std::vector<NvDsInferParseObjectInfo>& objectList)
+{
+    const NvDsInferLayerInfo& output = outputLayersInfo[0];
+    const float* data = (float*)output.buffer;
+
+    int numBoxes = output.inferDims.d[1];
+    int numClasses = detectionParams.perClassPreclusterThreshold.size();
+
+    for (int i = 0; i < numBoxes; i++) {
+        int base = i * 6;
+
+        float x1 = data[base + 0];
+        float y1 = data[base + 1];
+        float x2 = data[base + 2];
+        float y2 = data[base + 3];
+        float conf = data[base + 4];
+        int cls = (int)data[base + 5];
+
+        if (cls < 0 || cls >= numClasses) continue;
+        if (conf < detectionParams.perClassPreclusterThreshold[cls]) continue;
+
+        NvDsInferParseObjectInfo obj;
+        obj.left = x1;
+        obj.top = y1;
+        obj.width = x2 - x1;
+        obj.height = y2 - y1;
+        obj.classId = cls;
+        obj.detectionConfidence = conf;
+
+        objectList.push_back(obj);
+    }
+    return true;
+}
+
+
+Compile:
+
+g++ -Wall -std=c++14 -fPIC \
+-I/opt/nvidia/deepstream/deepstream/sources/includes \
+-I/usr/local/cuda/include \
+custom_yolo_parser.cpp \
+-shared -o libnvdsinfer_custom_impl_Yolo.so
+
+5️⃣ Exporting ONNX (Host vs Container)
+Option A: Export on host
+yolo export model=best.pt format=onnx opset=12 simplify=True
+
+Option B: Export inside container
+pip install ultralytics onnx onnxsim
+yolo export model=best.pt format=onnx opset=12 simplify=True
+
+⚠ Important:
+
+ONNX exported on host must match:
+
+CUDA version
+
+TensorRT version
+
+Opset
+
+Mismatch may cause:
+❌ ONNX parse errors
+❌ Engine build failure
+
+6️⃣ Creating TensorRT Engine
+
+Inside container:
+
+/usr/bin/trtexec \
+  --onnx=best.onnx \
+  --saveEngine=best.engine \
+  --fp16
+
+7️⃣ Verifying ONNX Output
+/usr/bin/trtexec --onnx=best.onnx --dumpOutput
+
+
+Check:
+
+output0: (1x300x6)
+
+
+or
+
+(5x8400)
+
+8️⃣ Verifying Engine Output
+/usr/bin/trtexec --loadEngine=best.engine --dumpOutput
+
+9️⃣ Matching Model Output with Parser
+Model Output	Parser Expectation
+(1,300,6)	i * 6 indexing
+(5,8400)	custom layout logic
+Raw YOLO	parser + NMS required
+
+If mismatch:
+❌ No boxes
+❌ Segfault
+❌ Flickering
+
+🔟 DeepStream Config
+[property]
+gpu-id=0
+net-scale-factor=0.0039215686
+model-engine-file=/app/models/best.engine
+labelfile-path=/app/models/labels.txt
+batch-size=1
+network-type=0
+num-detected-classes=1
+gie-unique-id=1
+process-mode=1
+cluster-mode=4
+output-blob-names=output0
+
+custom-lib-path=/app/parser/libnvdsinfer_custom_impl_Yolo.so
+parse-bbox-func-name=NvDsInferParseYolo
+
+[class-attrs-all]
+pre-cluster-threshold=0.7
+
+11️⃣ Running Pipeline
+python3 src/deepstream_retail_analytics.py
+
+⚠ Common Issues
+Issue	Cause
+No boxes	Parser mismatch
+Segfault	Wrong dims access
+Flicker	No tracker / no NMS
+Engine fail	ONNX incompatibility
+Display fail	Missing DISPLAY mount
+✅ Final Status
+
+✔ GPU access
+✔ Webcam access
+✔ Custom model loaded
+✔ Parser matched
+✔ Engine verified
+✔ Bounding boxes drawn
+
+📌 Recommendation for Production
+
+✔ Export model with nms=True
+✔ Add nvtracker
+✔ Fix threshold to 0.7+
+✔ Lock CUDA/TRT versions
