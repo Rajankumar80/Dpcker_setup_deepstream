@@ -1,0 +1,115 @@
+xhost +local:docker
+
+docker run -it --rm \
+  --gpus all \
+  --net=host \
+  --privileged \
+  -e DISPLAY=$DISPLAY \
+  -e QT_X11_NO_MITSHM=1 \
+  -v /tmp/.X11-unix:/tmp/.X11-unix \
+  -v /dev/video0:/dev/video0 \
+  -v ~/reatil_analytics:/app \
+  deepstream-retail \
+  bash
+python3 src/deepstream_retail_analytics.py
+---------------------
+#include "nvdsinfer_custom_impl.h"
+#include <algorithm>
+#include <vector>
+#include <cmath>
+
+extern "C" bool NvDsInferParseYolo(
+    std::vector<NvDsInferLayerInfo> const& layers,
+    NvDsInferNetworkInfo const& info,
+    NvDsInferParseDetectionParams const& params,
+    std::vector<NvDsInferParseObjectInfo>& objects)
+{
+    const NvDsInferLayerInfo& out = layers[0];
+    const float* data = (float*)out.buffer;
+
+    int num_classes = params.perClassPreclusterThreshold.size();
+    int elements = out.inferDims.d[1];   // 5 + classes
+    int num_boxes = out.inferDims.d[2];  // 8400
+
+    for (int i = 0; i < num_boxes; i++) {
+        float x = data[0 * num_boxes + i];
+        float y = data[1 * num_boxes + i];
+        float w = data[2 * num_boxes + i];
+        float h = data[3 * num_boxes + i];
+        float obj = data[4 * num_boxes + i];
+
+        int best_cls = -1;
+        float best_conf = 0;
+
+        for (int c = 0; c < num_classes; c++) {
+            float cls_conf = data[(5 + c) * num_boxes + i];
+            if (cls_conf > best_conf) {
+                best_conf = cls_conf;
+                best_cls = c;
+            }
+        }
+
+        float conf = obj * best_conf;
+        if (conf < params.perClassPreclusterThreshold[best_cls])
+            continue;
+
+        NvDsInferParseObjectInfo o;
+        o.left = (x - w / 2) * info.width;
+        o.top  = (y - h / 2) * info.height;
+        o.width  = w * info.width;
+        o.height = h * info.height;
+        o.classId = best_cls;
+        o.detectionConfidence = conf;
+
+        objects.push_back(o);
+    }
+
+    return true;
+}
+
+CHECK_CUSTOM_PARSE_FUNC_PROTOTYPE(NvDsInferParseYolo);
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
