@@ -1,0 +1,1867 @@
+import os
+import json
+import time
+from .config.paths import CONFIG_PATH, DB_PATH, INPUT_DIR, PROJECT_ROOT, YOLO_MODEL, GENDER_MODEL, GENDER_LABELS
+import cv2
+from .database.db import init_db
+from .video_ingestion import create_multi_camera_capture
+import numpy as np
+import cvzone
+import sqlite3
+from datetime import datetime
+from queue import Queue
+import threading
+
+# OpenVINO imports
+try:
+    from openvino.runtime import Core, AsyncInferQueue
+    OPENVINO_AVAILABLE = True
+except ImportError:
+    # print("⚠️ OpenVINO not available, falling back to PyTorch YOLO")
+    OPENVINO_AVAILABLE = False
+
+# Import YOLO for fallback (always available)
+from ultralytics import YOLO
+
+# Import ByteTrack for tracking
+from boxmot import ByteTrack
+
+# Limit OpenVINO threads
+os.environ["OMP_NUM_THREADS"] = "4"
+
+
+# video capture logic in frame wise
+class FrameStream:
+    def __init__(self, folder):
+        self.frames = sorted([
+            os.path.join(folder, f)
+            for f in os.listdir(folder)
+            if f.lower().endswith((".jpg", ".png"))
+        ])
+        self.i = 0
+
+    def read(self):
+        if self.i >= len(self.frames):
+            return False, None
+
+        img = cv2.imread(self.frames[self.i])
+        self.i += 1
+        return True, img
+
+    def release(self):
+        pass
+
+
+class RetailAnalytics:
+    def __init__(self):
+        init_db()
+
+        # Add gender column to tables if not exists
+        self.init_db_columns()
+
+        with open(CONFIG_PATH, "r") as f:
+            cfg = json.load(f)
+
+        self.device = "cpu"
+        self.cameras = cfg["cameras"]
+        self.billing_dwell = cfg.get("billing_dwell_time", 10)
+        self.log_interval = cfg.get("log_interval", 10)
+
+        # Initialize YOLO detector (OpenVINO or PyTorch fallback)
+        if OPENVINO_AVAILABLE:
+            # print("🚀 Using OpenVINO YOLO for optimized performance")
+            self.init_openvino_yolo()
+        else:
+            # print("⚠️ OpenVINO not available, using PyTorch YOLO")
+            self.detector = YOLO(YOLO_MODEL)
+
+        # Initialize ByteTrack for tracking
+        self.tracker = ByteTrack(
+            track_thresh=0.4,
+            match_thresh=0.8,
+            min_hits=3,
+            track_buffer=90,
+            frame_rate=30
+        )
+
+        # Initialize OpenVINO face models
+        self.face_det_model = None
+        self.face_reid_model = None
+        self.init_openvino_face_models()
+
+        # Initialize gender classification model
+        self.gender_net = None
+        self.init_gender_model()
+
+        # Multi-camera setup
+        self.captures = {}
+        self.current_camera = None
+        self.cam_zones = {}
+        self.video_name = None
+        self.resolution = None
+
+        # Load zones from runtime file (UI-drawn zones)
+        runtime_zone_path = os.path.join(PROJECT_ROOT, "zones_runtime.json")
+        self.zones = {}
+        if os.path.exists(runtime_zone_path):
+            try:
+                with open(runtime_zone_path, "r") as f:
+                    self.zones = json.load(f)
+            except Exception as e:
+                print("⚠️ Failed to load runtime zones:", e)
+
+        # Initialize first camera
+        if self.cameras:
+            self.current_camera = list(self.cameras.keys())[0]
+            self._open_video()
+
+        self.track_history = {}
+        # ⏱️ ZONE MONITORING
+        self.cashier_last_seen = time.time()
+        self.security_last_seen = time.time()
+
+        self.CASHIER_TIMEOUT = 20
+        self.SECURITY_TIMEOUT = 20
+        self.cashier_alert_sent = False
+        self.security_alert_sent = False
+        self.unique_tracks = set()
+        self.seen_once = set()
+
+        # Track memory
+        self.last_positions = {}
+        self.last_frame_time = 0
+        self.staff_pids = set()
+        self.load_staff_pids()
+
+        # 🔴 BBOX STABILIZATION STATE
+        self.bbox_state = {}
+        self.last_seen = {}
+        # 🧾 BILLING CONVERSION STATE
+        self.billing_enter_time = {}
+        self.billing_converted = set()
+
+        # Store latest face image per PID for demographic classification
+        self.latest_face_image = {}
+
+        # ===============================
+        # 🧠 IDENTITY ENGINE (Layer 2)
+        # ===============================
+        self.tid_to_pid = {}
+        self.pid_embeddings = {}
+        self.pid_demographics = {}
+        self.pid_state = {}
+        self.next_pid = 1
+        self.last_seen_pid = {}
+        self.interactions = {}
+        self.interaction_events = []
+        self.logged_interactions = set()
+        self.gender_stats = {"Male": 0, "Female": 0, "unknown": 0}
+        self.age_stats = {
+            "0-10": 0, "10-20": 0, "20-30": 0,
+            "30-40": 0, "40-50": 0, "50-60": 0, "60-90": 0, "unknown": 0
+        }
+
+        self.events = []
+        self.last_dump = time.time()
+
+        self.active_interactions = {}
+        self.event_queue = Queue(maxsize=5000)
+        self.face_queue = Queue(maxsize=2000)
+        self.face_frame_skip = 5
+        self.frame_count = 0
+        # PID state machine
+        self.ENTRY_MAX_WAIT = 3.0
+
+        # ===============================
+        # 🧾 VISIT ENGINE
+        # ===============================
+        self.active_visits = {}
+        self.visit_start_time = {}
+        self.visit_zones = {}
+        self.next_visit_id = 1
+
+        # Zone dwell tracking
+        self.zone_dwell = {}
+
+        # 🔥 STEP 1 — Create Frame Queue
+        self.frame_queue = Queue(maxsize=25)
+
+        # Capture metrics
+        self.capture_count = 0
+        self.capture_drops = 0
+        self.capture_failures = 0
+        self.capture_second = 0
+
+        # Processing metrics
+        self.process_count = 0
+        self.process_second = 0
+
+        # Frame counting and performance monitoring
+        self.total_frames = 0
+        self.processed_frames = 0
+        self.processing_backlog = 0
+
+        # FPS calculation variables
+        self.fps_start_time = time.time()
+        self.fps_frame_count = 0
+        self.current_fps = 0
+
+        # Performance monitoring (per-second counters)
+        self.total_latency = 0
+        self.max_latency = 0
+        self.latency_second = 0
+        self.last_stats_time = time.time()
+        self.second_processed = 0
+        self.second_dropped = 0
+
+        # ===============================
+        # 📊 PRODUCTION METRICS
+        # ===============================
+        # Per-second counters
+        self.second_capture_count = 0
+        self.second_pipeline_count = 0
+        
+        # Latency accumulators (per second)
+        self.tracker_latency_sum = 0.0
+        self.tracker_latency_max = 0.0
+        self.full_latency_sum = 0.0
+        self.full_latency_max = 0.0
+        self.face_latency_sum = 0.0
+        self.face_latency_max = 0.0
+        self.db_latency_sum = 0.0
+        self.db_latency_max = 0.0
+        
+        # YOLO compute latency
+        self.yolo_latency_sum = 0.0
+        self.yolo_latency_max = 0.0
+        self.total_yolo_latency = 0.0
+        self.total_yolo_samples = 0
+        
+        # Face detection compute latency
+        self.face_det_latency_sum = 0.0
+        self.face_det_latency_max = 0.0
+        self.total_face_det_latency = 0.0
+        self.total_face_det_samples = 0
+        
+        # Face reidentification compute latency
+        self.face_reid_latency_sum = 0.0
+        self.face_reid_latency_max = 0.0
+        self.total_face_reid_latency = 0.0
+        self.total_face_reid_samples = 0
+        
+        # Overall cumulative averages
+        self.total_tracker_latency = 0.0
+        self.total_full_latency = 0.0
+        self.total_face_latency = 0.0
+        self.total_db_latency = 0.0
+        self.total_tracker_samples = 0
+        self.total_full_samples = 0
+        self.total_face_samples = 0
+        self.total_db_samples = 0
+
+        # 🔥 SHUTDOWN FLAG MUST BE DEFINED BEFORE THREADS
+        self.shutdown = False
+
+        # Gate and interaction state
+        self.pid_gate_side = {}
+        self.pid_gate_last_event = {}
+        self.GATE_COOLDOWN = 2.0
+        self.pid_last_vote_time = {}
+        self.VOTE_COOLDOWN = 1.0
+
+        # 🔥 Load embeddings from database for persistent biometric IDs
+        self.load_pid_embeddings()
+
+        # 🔥 START DB WORKER
+        threading.Thread(target=self.db_worker, daemon=True).start()
+
+        # 🔥 START MULTI-CAMERA CAPTURE
+        self.multi_capture = create_multi_camera_capture(
+            cameras=self.cameras,
+            frame_queue=self.frame_queue,
+            metrics_ref=self,
+            use_gstreamer=False
+        )
+        self.multi_capture.start()
+
+        # 🔥 START 3-THREAD ARCHITECTURE (YOLO → Tracking → Face)
+        self.detection_queue = Queue(maxsize=15)
+        self.face_queue_in = Queue(maxsize=20)
+        self.face_queue_out = Queue(maxsize=20)
+
+        self.yolo_thread = threading.Thread(target=self.yolo_loop, daemon=True)
+        self.tracking_thread = threading.Thread(target=self.tracking_loop, daemon=True)
+        self.face_thread = threading.Thread(target=self.face_loop, daemon=True)
+        self.yolo_thread.start()
+        self.tracking_thread.start()
+        self.face_thread.start()
+
+    def init_db_columns(self):
+        """Add gender column to tables if not exists"""
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            cur = conn.cursor()
+            
+            # Add gender column to visits if not exists
+            try:
+                cur.execute("ALTER TABLE visits ADD COLUMN gender TEXT DEFAULT 'unknown'")
+            except sqlite3.OperationalError:
+                pass  # Column already exists
+            
+            # Add gender column to zone_events if not exists
+            try:
+                cur.execute("ALTER TABLE zone_events ADD COLUMN gender TEXT DEFAULT 'unknown'")
+            except sqlite3.OperationalError:
+                pass  # Column already exists
+            
+            # Add gender column to interactions if not exists
+            try:
+                cur.execute("ALTER TABLE interactions ADD COLUMN gender TEXT DEFAULT 'unknown'")
+            except sqlite3.OperationalError:
+                pass  # Column already exists
+                
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"⚠️ DB column init error: {e}")
+
+    def init_openvino_yolo(self):
+        """Optimized OpenVINO YOLO initialization for 6-camera CPU deployment"""
+        try:
+            openvino_model_paths = [
+                os.path.join(PROJECT_ROOT, "yolov8n_int8_openvino_model"),
+                os.path.join(PROJECT_ROOT, "models", "yolov8n_openvino_model"),
+                os.path.join(os.path.dirname(YOLO_MODEL), "yolov8n_openvino_model"),
+            ]
+
+            xml_path = None
+            bin_path = None
+
+            for model_path in openvino_model_paths:
+                if os.path.exists(model_path):
+                    candidate_xml = os.path.join(model_path, "yolov8n.xml")
+                    candidate_bin = os.path.join(model_path, "yolov8n.bin")
+                    if os.path.exists(candidate_xml) and os.path.exists(candidate_bin):
+                        xml_path = candidate_xml
+                        bin_path = candidate_bin
+                        print(f"✅ Found OpenVINO model at: {model_path}")
+                        break
+
+            if not xml_path:
+                xml_path = YOLO_MODEL + ".xml"
+                bin_path = YOLO_MODEL + ".bin"
+                if not os.path.exists(xml_path) or not os.path.exists(bin_path):
+                    print("⚠️ OpenVINO model files not found, falling back to PyTorch")
+                    self.detector = YOLO(YOLO_MODEL)
+                    return
+
+            # Initialize OpenVINO core
+            self.core = Core()
+            model = self.core.read_model(xml_path, bin_path)
+
+            # Force static input shape (1x3x640x640) to avoid dynamic shape usage
+            model.reshape({model.input(0): [1, 3, 640, 640]})
+
+            # 🔥 OPTIMIZED compile configuration
+            self.compiled_model = self.core.compile_model(
+                model,
+                "CPU",
+                {
+                    "PERFORMANCE_HINT": "LATENCY",
+                    "INFERENCE_NUM_THREADS": "3"
+                }
+            )
+
+            # Get output layer for direct inference
+            self.output_layer = self.compiled_model.output(0)
+            self.input_layer = self.compiled_model.input(0)
+            _, _, self.INPUT_H, self.INPUT_W = self.input_layer.shape
+
+            # 🔥 Single async job for controlled execution
+            self.infer_queue = AsyncInferQueue(self.compiled_model, jobs=1)
+            self.infer_queue.set_callback(self.yolo_callback)
+
+            print("✅ OpenVINO YOLO initialized for multi-camera deployment")
+            print(f"   Model: {xml_path}")
+            print(f"   Mode: LATENCY")
+            print(f"   Threads: 4")
+            print(f"   Async jobs: 1")
+
+        except Exception as e:
+            print(f"❌ OpenVINO initialization failed: {e}")
+            print("⚠️ Falling back to PyTorch YOLO")
+            self.detector = YOLO(YOLO_MODEL)
+
+    def init_openvino_face_models(self):
+        """Initialize OpenVINO face detection and reidentification models"""
+        try:
+            # Face detection model paths
+            face_det_xml = os.path.join(PROJECT_ROOT, "models", "face", "face-detection-retail-0004.xml")
+            face_det_bin = os.path.join(PROJECT_ROOT, "models", "face", "face-detection-retail-0004.bin")
+
+            # Face reidentification model paths
+            face_reid_xml = os.path.join(PROJECT_ROOT, "models", "face", "face-reidentification-retail-0095.xml")
+            face_reid_bin = os.path.join(PROJECT_ROOT, "models", "face", "face-reidentification-retail-0095.bin")
+
+            if not OPENVINO_AVAILABLE:
+                print("⚠️ OpenVINO not available for face models")
+                return
+
+            # Check if face models exist
+            if os.path.exists(face_det_xml) and os.path.exists(face_det_bin):
+                self.face_det_model = self.core.read_model(face_det_xml, face_det_bin)
+                self.compiled_face_det = self.core.compile_model(self.face_det_model, "CPU")
+                self.face_det_output = self.compiled_face_det.output(0)
+                # print("✅ OpenVINO face detection model loaded")
+            else:
+                # print("⚠️ OpenVINO face detection model files not found")
+                return
+
+            if os.path.exists(face_reid_xml) and os.path.exists(face_reid_bin):
+                self.face_reid_model = self.core.read_model(face_reid_xml, face_reid_bin)
+                self.compiled_face_reid = self.core.compile_model(self.face_reid_model, "CPU")
+                self.face_reid_output = self.compiled_face_reid.output(0)
+                # print("✅ OpenVINO face reidentification model loaded")
+            else:
+                # print("⚠️ OpenVINO face reidentification model files not found")
+                return
+
+            # print("✅ OpenVINO face models initialized successfully")
+
+        except Exception as e:
+            # print(f"❌ OpenVINO face model initialization failed: {e}")
+            self.face_det_model = None
+            self.face_reid_model = None
+
+    def init_gender_model(self):
+        """Initialize gender classification model"""
+        try:
+            if os.path.exists(GENDER_MODEL):
+                self.gender_net = cv2.dnn.readNetFromONNX(GENDER_MODEL)
+                # print("✅ Gender classification model loaded")
+            else:
+                print("⚠️ Gender model not found, gender classification will be unavailable")
+        except Exception as e:
+            print(f"⚠️ Gender model initialization failed: {e}")
+            self.gender_net = None
+
+    def letterbox(self, img, new_shape=(640, 640), color=(114, 114, 114)):
+        """Letterbox image for YOLO inference"""
+        shape = img.shape[:2]
+        r = min(new_shape[0] / shape[0], new_shape[1] / shape[1])
+        ratio = r
+
+        new_unpad = (int(round(shape[1] * r)), int(round(shape[0] * r)))
+        dw = new_shape[1] - new_unpad[0]
+        dh = new_shape[0] - new_unpad[1]
+        dw /= 2
+        dh /= 2
+
+        img = cv2.resize(img, new_unpad, interpolation=cv2.INTER_LINEAR)
+        top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
+        left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
+
+        img = cv2.copyMakeBorder(img, top, bottom, left, right,
+                                 cv2.BORDER_CONSTANT, value=color)
+
+        return img, ratio, dw, dh
+
+    def preprocess(self, frame):
+        """Preprocess frame for OpenVINO YOLO inference"""
+        img, ratio, dw, dh = self.letterbox(frame, (self.INPUT_H, self.INPUT_W))
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        img = img.transpose(2, 0, 1)
+        img = np.expand_dims(img, axis=0)
+        img = img.astype(np.float32) / 255.0
+        return img, ratio, dw, dh
+
+    def postprocess(self, output, frame_shape, ratio, dw, dh):
+        output = np.squeeze(output).T
+        detections = []
+
+        h, w = frame_shape[:2]
+
+        for row in output:
+            cx, cy, w_box, h_box = row[:4]
+            class_scores = row[4:]
+
+            class_id = np.argmax(class_scores)
+            conf = float(class_scores[class_id])
+
+            if class_id != 0:
+                continue
+
+            if conf < 0.15:
+                continue
+
+            x1 = cx - w_box / 2
+            y1 = cy - h_box / 2
+            x2 = cx + w_box / 2
+            y2 = cy + h_box / 2
+
+            x1 = (x1 - dw) / ratio
+            y1 = (y1 - dh) / ratio
+            x2 = (x2 - dw) / ratio
+            y2 = (y2 - dh) / ratio
+
+            x1 = int(max(0, min(w, x1)))
+            y1 = int(max(0, min(h, y1)))
+            x2 = int(max(0, min(w, x2)))
+            y2 = int(max(0, min(h, y2)))
+
+            detections.append([x1, y1, x2, y2, conf, 0])
+
+        if len(detections) == 0:
+            return np.array([])
+
+        boxes = []
+        scores = []
+
+        for det in detections:
+            boxes.append([det[0], det[1], det[2] - det[0], det[3] - det[1]])
+            scores.append(det[4])
+
+        indices = cv2.dnn.NMSBoxes(boxes, scores, 0.15, 0.5)
+
+        final_dets = []
+
+        if len(indices) > 0:
+            for i in indices.flatten():
+                final_dets.append(detections[i])
+
+        return np.array(final_dets)
+
+    def yolo_callback(self, infer_request, user_data):
+        """Callback function for OpenVINO async inference"""
+        try:
+            frame, capture_time, ratio, dw, dh, yolo_start = user_data
+            output = infer_request.get_output_tensor().data
+            
+            # Measure YOLO compute latency (from start_async to callback)
+            yolo_latency = time.time() - yolo_start
+            self.yolo_latency_sum += yolo_latency
+            self.yolo_latency_max = max(self.yolo_latency_max, yolo_latency)
+            self.total_yolo_latency += yolo_latency
+            self.total_yolo_samples += 1
+            
+            detections = self.postprocess(output, frame.shape, ratio, dw, dh)
+
+            try:
+                self.detection_queue.put_nowait((frame, detections, capture_time))
+            except:
+                pass
+
+        except Exception as e:
+            print(f"YOLO callback error: {e}")
+            try:
+                frame, capture_time = user_data
+                self.detection_queue.put_nowait((frame, [], capture_time))
+            except:
+                pass
+
+    def classify_gender(self, face_crop):
+        """Classify gender from face image using ONNX model"""
+        if self.gender_net is None or face_crop is None or face_crop.size == 0:
+            return "unknown"
+        
+        try:
+            blob = cv2.dnn.blobFromImage(
+                face_crop, 1.0, (227, 227),
+                (78.426, 87.768, 114.895),
+                swapRB=False
+            )
+            self.gender_net.setInput(blob)
+            return GENDER_LABELS[self.gender_net.forward().argmax()]
+        except Exception as e:
+            print(f"Gender classification error: {e}")
+            return "unknown"
+
+    def classify_age(self, face_crop):
+        """Classify age from face image - returns age group"""
+        # Age classification from face is complex, return unknown if no model
+        # In production, would use age-gender-recognition-retail-0013 model
+        return "unknown"
+
+    def handle_tracks(self, frame, tracks_raw, capture_time):
+        """Process tracks and handle all track-related logic"""
+        tracks = []
+        for t in tracks_raw:
+            if len(t) < 5:
+                continue
+
+            if any(np.isnan(val) for val in t[:5]):
+                continue
+
+            try:
+                x1, y1, x2, y2, tid = map(int, t[:5])
+                if x1 < 0 or y1 < 0 or x2 <= x1 or y2 <= y1:
+                    continue
+                tracks.append([x1, y1, x2, y2, tid])
+            except (ValueError, TypeError):
+                continue
+
+        for t in tracks:
+            face_img = None
+            face_emb = None
+            x1, y1, x2, y2, tid = map(int, t[:5])
+            cx = (x1 + x2) // 2
+            cy = (y1 + y2) // 2
+
+            h = y2 - y1
+
+            bbox = [x1, y1, x2, y2]
+            now_ts = time.time()
+
+            # ✅ UPDATE POSITION FIRST
+            self.last_positions[tid] = (cx, cy, now_ts)
+
+            # 🧠 CLEAN OLD POSITIONS
+            for old_tid in list(self.last_positions.keys()):
+                if now_ts - self.last_positions[old_tid][2] > 30.0:
+                    self.last_positions.pop(old_tid, None)
+
+            # ==============================
+            # 🔐 FACE + PID ASSIGNMENT (HYBRID)
+            pid = None
+            if tid in self.tid_to_pid:
+                pid = self.tid_to_pid[tid]
+            else:
+                # 🔥 SEND FACE REQUEST TO FACE THREAD
+                if self.frame_count % self.face_frame_skip == 0:
+                    try:
+                        self.face_queue_in.put_nowait((frame.copy(), bbox, tid, capture_time))
+                    except:
+                        pass
+
+                # Try to get face results from face thread
+                try:
+                    face_result = self.face_queue_out.get_nowait()
+                    tid_from_face, face_emb, face_img = face_result
+                    if tid_from_face == tid:
+                        matched_pid = self.match_face(face_emb)
+                        if matched_pid is not None:
+                            pid = matched_pid
+                        else:
+                            pid = self.next_pid
+                            self.next_pid += 1
+
+                        if pid not in self.pid_embeddings:
+                            self.pid_embeddings[pid] = face_emb
+
+                        prev = self.pid_state.get(pid, "TRACK_ONLY")
+                        if prev != "DEMO_LOCKED":
+                            self.pid_state[pid] = "FACE_CONFIRMED"
+
+                        # Store latest face image for this PID
+                        if face_img is not None:
+                            self.latest_face_image[pid] = face_img
+
+                        if face_img is not None:
+                            success, buffer = cv2.imencode(".png", face_img)
+                            if success:
+                                now = datetime.now()
+                                try:
+                                    self.face_queue.put_nowait((
+                                        pid,
+                                        buffer.tobytes(),
+                                        face_emb.astype(np.float32).tobytes() if face_emb is not None else None,
+                                        now.strftime("%Y-%m-%d"),
+                                        now.strftime("%H:%M:%S"),
+                                        self.video_name,
+                                        capture_time
+                                    ))
+                                except:
+                                    pass
+                    else:
+                        try:
+                            self.face_queue_out.put_nowait(face_result)
+                        except:
+                            pass
+                except:
+                    # No face result available yet, use tracking-based PID
+                    pid = self.inherit_pid(tid, cx, cy)
+                    if pid is None:
+                        pid = self.next_pid
+                        self.next_pid += 1
+
+                    if pid not in self.pid_state:
+                        self.pid_state[pid] = "TRACK_ONLY"
+
+                self.tid_to_pid[tid] = pid
+
+            # Handle case where pid is still None
+            if pid is None:
+                pid = self.next_pid
+                self.next_pid += 1
+                self.tid_to_pid[tid] = pid
+                self.pid_state[pid] = "TRACK_ONLY"
+
+            role = self.get_role(pid)
+            self.last_seen_pid[pid] = (cx, cy, time.time())
+
+            # 👥 STAFF–CUSTOMER INTERACTION
+            if role == "STAFF":
+                for other_tid, (ox, oy, ots) in self.last_positions.items():
+                    other_pid = self.tid_to_pid.get(other_tid)
+                    if other_pid is None or other_pid == pid:
+                        continue
+                    if other_pid in self.staff_pids:
+                        continue
+
+                    d = self.distance((cx, cy), (ox, oy))
+                    key = (pid, other_pid)
+
+                    if d < 80:
+                        if key not in self.interactions:
+                            self.interactions[key] = time.time()
+                        else:
+                            duration = time.time() - self.interactions[key]
+                            self.active_interactions[pid] = {
+                                "customer_pid": other_pid,
+                                "duration": duration
+                            }
+
+                            if duration >= 2 and key not in self.logged_interactions:
+                                self.logged_interactions.add(key)
+                                now = datetime.now()
+                                # Get gender from demographics
+                                gender = "unknown"
+                                if pid in self.pid_demographics:
+                                    gender = self.pid_demographics[pid][0]
+                                try:
+                                    conn = sqlite3.connect(DB_PATH)
+                                    cur = conn.cursor()
+                                    cur.execute("""
+                                        INSERT INTO interactions
+                                        (date, time, staff_pid, customer_pid, duration, video, gender)
+                                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                                    """, (
+                                        now.strftime("%Y-%m-%d"),
+                                        now.strftime("%H:%M:%S"),
+                                        pid,
+                                        other_pid,
+                                        round(duration, 2),
+                                        self.video_name,
+                                        gender
+                                    ))
+                                    conn.commit()
+                                    conn.close()
+                                except Exception as e:
+                                    print("❌ Interaction DB error:", e)
+                    else:
+                        self.interactions.pop(key, None)
+                        self.logged_interactions.discard(key)
+                        self.active_interactions.pop(pid, None)
+
+            raw_bbox = [x1, y1, x2, y2]
+            bbox = self.occlusion_guard(tid, raw_bbox)
+            bbox = self.smooth_bbox(tid, bbox, h, frame.shape[0])
+
+            x1, y1, x2, y2 = bbox
+            self.last_seen[tid] = time.time()
+            cx = (x1 + x2) // 2
+            cy = (y1 + y2) // 2
+            now_ts = time.time()
+
+            # CASHIER PRESENCE
+            if self.cashier_zone:
+                currently_inside = self.point_in_zone(cx, cy, self.cashier_zone)
+                self.handle_zone(pid, "cashier", currently_inside)
+                if currently_inside:
+                    self.cashier_last_seen = time.time()
+                    self.cashier_alert_sent = False
+
+            # SECURITY PRESENCE
+            if self.security_zone:
+                currently_inside = self.point_in_zone(cx, cy, self.security_zone)
+                self.handle_zone(pid, "security", currently_inside)
+                if currently_inside:
+                    self.security_last_seen = time.time()
+                    self.security_alert_sent = False
+
+            # 🚪 ENTRY / EXIT GATE
+            if self.gate:
+                gate_x = self.gate["p1"][0]
+                curr_side = "LEFT" if cx < gate_x else "RIGHT"
+
+                if pid not in self.pid_gate_side:
+                    self.pid_gate_side[pid] = curr_side
+                else:
+                    prev_side = self.pid_gate_side[pid]
+                    if prev_side != curr_side:
+                        self.pid_gate_side[pid] = curr_side
+                        if prev_side == "LEFT":
+                            self.handle_entry(pid)
+                        elif prev_side == "RIGHT":
+                            self.close_visit(pid)
+
+            # 🎨 DARK GREEN BBOX
+            cvzone.cornerRect(
+                frame,
+                (x1, y1, x2 - x1, y2 - y1),
+                l=6,
+                rt=2,
+                colorR=(0, 255, 0)
+            )
+
+            label = f"{role} | PID {pid} | TID {tid}"
+            if pid in self.pid_demographics:
+                g, a = self.pid_demographics[pid]
+                label += f" | {g} | {a}"
+
+            cv2.putText(
+                frame,
+                label,
+                (x1, y1 - 8),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (0, 255, 0),
+                2
+            )
+
+            # 🧾 BILLING CONVERSION LOGIC
+            if self.billing_zone:
+                currently_inside = self.point_in_zone(cx, cy, self.billing_zone)
+                self.handle_zone(pid, "billing", currently_inside)
+
+            # unique customer
+            if self.gate:
+                gate_x = self.gate["p1"][0]
+                ENTRY_MARGIN = 40
+
+                if cx > gate_x + ENTRY_MARGIN:
+                    if pid not in self.seen_once:
+                        self.seen_once.add(pid)
+                        self.unique_tracks.add(f"{self.video_name}_{pid}")
+
+                self.unique_tracks.add(f"{self.video_name}_{pid}")
+
+            if pid in self.active_interactions:
+                info = self.active_interactions[pid]
+                duration = info["duration"]
+
+                cv2.putText(
+                    frame,
+                    f"INTERACTING {int(duration)}s",
+                    (cx - 40, cy - 40),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (0, 0, 255),
+                    2
+                )
+
+            # 🎨 DRAW ZONES ON FRAME
+            if self.gate and self.gate["p1"] and self.gate["p2"]:
+                p1 = tuple(self.gate["p1"])
+                p2 = tuple(self.gate["p2"])
+                cv2.line(frame, p1, p2, (255, 0, 0), 2)
+                cv2.putText(frame, "GATE", (p1[0], p1[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
+
+            if self.billing_zone and len(self.billing_zone) >= 3:
+                pts = np.array(self.billing_zone, np.int32)
+                pts = pts.reshape((-1, 1, 2))
+                cv2.polylines(frame, [pts], True, (0, 255, 255), 2)
+                cv2.putText(frame, "BILLING", (self.billing_zone[0][0], self.billing_zone[0][1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+
+            if self.cashier_zone and len(self.cashier_zone) >= 3:
+                pts = np.array(self.cashier_zone, np.int32)
+                pts = pts.reshape((-1, 1, 2))
+                cv2.polylines(frame, [pts], True, (255, 255, 0), 2)
+                cv2.putText(frame, "CASHIER", (self.cashier_zone[0][0], self.cashier_zone[0][1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
+
+            if self.security_zone and len(self.security_zone) >= 3:
+                pts = np.array(self.security_zone, np.int32)
+                pts = pts.reshape((-1, 1, 2))
+                cv2.polylines(frame, [pts], True, (0, 0, 255), 2)
+                cv2.putText(frame, "SECURITY", (self.security_zone[0][0], self.security_zone[0][1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+
+            # Calculate current FPS for display
+            current_time = time.time()
+            if current_time - self.fps_start_time >= 1.0:
+                self.current_fps = self.fps_frame_count / (current_time - self.fps_start_time)
+                self.fps_frame_count = 0
+                self.fps_start_time = current_time
+
+            # Display real-time statistics on frame
+            cv2.putText(
+                frame,
+                f"FPS: {self.current_fps:.1f}",
+                (20, 100),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 255, 255),
+                2
+            )
+
+            cv2.putText(
+                frame,
+                f"Total: {self.total_frames}",
+                (20, 130),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (255, 255, 255),
+                2
+            )
+
+            cv2.putText(
+                frame,
+                f"Capture Drops: {self.capture_drops}",
+                (20, 160),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 0, 255),
+                2
+            )
+
+            drop_rate = (self.capture_drops / self.capture_count * 100) if self.capture_count > 0 else 0
+            cv2.putText(
+                frame,
+                f"Drop Rate: {drop_rate:.1f}%",
+                (20, 190),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 0, 255),
+                2
+            )
+
+            # Save frame for UI display
+            self._last_frame = frame
+
+    def _open_video(self):
+        print("Current camera:", self.current_camera)
+
+        # Multi-camera RTSP setup
+        if self.current_camera in self.cameras:
+            cam_info = self.cameras[self.current_camera]
+            rtsp_url = cam_info["rtsp"]
+            self.resolution = cam_info.get("resolution", None)
+            self.video_name = self.current_camera
+
+            print(f"🎥 Opening RTSP camera: {self.current_camera}")
+
+            self.cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
+
+            # Reduce latency
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            if self.resolution:
+                self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.resolution[0])
+                self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.resolution[1])
+
+            if not self.cap.isOpened():
+                raise RuntimeError(f"❌ RTSP camera {self.current_camera} not accessible")
+
+            # Load camera-specific zones
+            if self.current_camera in self.zones:
+                self.cam_zones = self.zones[self.current_camera]
+            else:
+                self.cam_zones = self.zones
+
+            self.gate = self.cam_zones.get("gate_line")
+            self.billing_zone = self.cam_zones.get("billing")
+            self.cashier_zone = self.cam_zones.get("cashier")
+            self.security_zone = self.cam_zones.get("security")
+
+            print(f"✅ Zones loaded for camera: {self.current_camera}")
+
+        else:
+            # File mode fallback
+            print("🎞 Opening file-based video...")
+
+            self.video_name = self.start_video
+
+            meta = self.video_cfg.get(self.video_name, {})
+            self.resolution = meta.get("resolution", None)
+            self.zones = meta.get("zones", {})
+
+            runtime_zone_path = os.path.join(PROJECT_ROOT, "zones_runtime.json")
+            runtime = None
+
+            if os.path.exists(runtime_zone_path):
+                try:
+                    with open(runtime_zone_path, "r") as f:
+                        runtime = json.load(f)
+                except:
+                    pass
+
+            if runtime and runtime.get("video") in (None, self.video_name):
+                self.gate = runtime.get("gate_line")
+                self.billing_zone = runtime.get("billing")
+                self.cashier_zone = runtime.get("cashier")
+                self.security_zone = runtime.get("security")
+            else:
+                self.gate = self.zones.get("gate_line")
+                self.billing_zone = self.zones.get("billing")
+                self.cashier_zone = self.zones.get("cashier")
+                self.security_zone = self.zones.get("security")
+
+            path = os.path.join(INPUT_DIR, self.video_name)
+            self.cap = cv2.VideoCapture(path)
+
+    def load_staff_pids(self):
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute("SELECT pid FROM staff_registry")
+        rows = cur.fetchall()
+        self.staff_pids = {row[0] for row in rows}
+        conn.close()
+
+    def load_pid_embeddings(self):
+        """Load embeddings from database for persistent biometric IDs"""
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            cur = conn.cursor()
+
+            # Load face embeddings from faces table
+            cur.execute("""
+                SELECT DISTINCT pid, embedding
+                FROM faces
+                WHERE embedding IS NOT NULL
+            """)
+            rows = cur.fetchall()
+
+            for pid, embedding_blob in rows:
+                try:
+                    if embedding_blob:
+                        embedding_array = np.frombuffer(embedding_blob, dtype=np.float32)
+                        if pid not in self.pid_embeddings:
+                            self.pid_embeddings[pid] = embedding_array
+                            self.pid_state[pid] = "FACE_CONFIRMED"
+                except Exception as e:
+                    print(f"Error loading embedding for PID {pid}: {e}")
+                    continue
+
+            # Also load demographics from shopper_profiles
+            cur.execute("SELECT pid, gender, age_group FROM shopper_profiles")
+            profile_rows = cur.fetchall()
+            for pid, gender, age_group in profile_rows:
+                if pid not in self.pid_demographics:
+                    self.pid_demographics[pid] = (gender, age_group)
+                    self.pid_state[pid] = "LOCKED"
+
+            # Find the highest PID to set next_pid correctly
+            cur.execute("SELECT MAX(pid) FROM faces UNION SELECT MAX(pid) FROM shopper_profiles")
+            max_pid_result = cur.fetchone()
+            if max_pid_result and max_pid_result[0]:
+                self.next_pid = max_pid_result[0] + 1
+
+            conn.close()
+            print(f"✅ Loaded {len(self.pid_embeddings)} persistent PIDs with embeddings from database")
+
+        except Exception as e:
+            print(f"⚠️ Failed to load PID embeddings: {e}")
+
+    def point_in_zone(self, cx, cy, zone):
+        if not zone:
+            return False
+        return cv2.pointPolygonTest(
+            np.array(zone, np.int32),
+            (cx, cy),
+            False
+        ) >= 0
+
+    def get_face_openvino(self, frame, bbox):
+        """OpenVINO face detection and reidentification"""
+        x1, y1, x2, y2 = bbox
+        person_crop = frame[y1:y2, x1:x2]
+
+        if person_crop.size == 0:
+            return None, None
+
+        # Face detection using OpenVINO
+        resized = cv2.resize(person_crop, (300, 300))
+        blob = resized.transpose(2, 0, 1)[None].astype(np.float32)
+
+        # Measure face detection latency
+        det_start = time.time()
+        detections = self.compiled_face_det([blob])[self.face_det_output][0][0]
+        face_det_latency = time.time() - det_start
+        
+        self.face_det_latency_sum += face_det_latency
+        self.face_det_latency_max = max(self.face_det_latency_max, face_det_latency)
+        self.total_face_det_latency += face_det_latency
+        self.total_face_det_samples += 1
+
+        for det in detections:
+            if det[2] < 0.6:
+                continue
+
+            fx1 = int(det[3] * person_crop.shape[1])
+            fy1 = int(det[4] * person_crop.shape[0])
+            fx2 = int(det[5] * person_crop.shape[1])
+            fy2 = int(det[6] * person_crop.shape[0])
+
+            face_crop = person_crop[fy1:fy2, fx1:fx2]
+            if face_crop.size == 0:
+                continue
+
+            # Face reidentification using OpenVINO
+            face_crop = cv2.resize(face_crop, (128, 128))
+            face_blob = face_crop.transpose(2, 0, 1)[None].astype(np.float32)
+
+            # Measure face reidentification latency
+            reid_start = time.time()
+            result = self.compiled_face_reid([face_blob])[self.face_reid_output]
+            face_reid_latency = time.time() - reid_start
+            
+            self.face_reid_latency_sum += face_reid_latency
+            self.face_reid_latency_max = max(self.face_reid_latency_max, face_reid_latency)
+            self.total_face_reid_latency += face_reid_latency
+            self.total_face_reid_samples += 1
+            
+            emb = result.flatten()
+            emb = emb / np.linalg.norm(emb)
+
+            return emb, face_crop
+
+        return None, None
+
+    def get_face(self, frame, bbox):
+        """Use OpenVINO face reidentification model"""
+        if self.face_det_model is not None and self.face_reid_model is not None:
+            return self.get_face_openvino(frame, bbox)
+
+        # If OpenVINO models are not available, return None
+        print("⚠️ OpenVINO face models not available, skipping face processing")
+        return None, None
+
+    def get_role(self, pid):
+        return "STAFF" if pid in self.staff_pids else "CUSTOMER"
+
+    def match_face(self, emb):
+        best_pid = None
+        best_sim = 0
+
+        for pid, db_emb in self.pid_embeddings.items():
+            sim = np.dot(emb, db_emb) / (np.linalg.norm(emb) * np.linalg.norm(db_emb))
+
+            if sim > best_sim:
+                best_sim = sim
+                best_pid = pid
+
+        if best_sim > 0.55:
+            return best_pid
+        return None
+
+    def inherit_pid(self, tid, cx, cy):
+        now = time.time()
+        best_pid = None
+        best_dist = 1e9
+
+        for pid, data in self.last_seen_pid.items():
+            if data is None:
+                continue
+
+            px, py, ts = data
+            if now - ts > 2.0:
+                continue
+
+            d = np.hypot(cx - px, cy - py)
+            if d < best_dist and d < 80:
+                best_dist = d
+                best_pid = pid
+
+        return best_pid
+
+    def occlusion_guard(self, tid, bbox):
+        if tid not in self.bbox_state:
+            return bbox
+
+        prev = self.bbox_state[tid]
+        prev_h = prev[3] - prev[1]
+        curr_h = bbox[3] - bbox[1]
+
+        if curr_h < 0.5 * prev_h:
+            return prev
+
+        return bbox
+
+    def smooth_bbox(self, tid, bbox, h, frame_h):
+        ratio = h / frame_h
+
+        if ratio > 0.4:
+            alpha = 0.85
+        elif ratio > 0.25:
+            alpha = 0.70
+        else:
+            alpha = 0.45
+
+        if tid not in self.bbox_state:
+            self.bbox_state[tid] = bbox
+            return bbox
+
+        prev = self.bbox_state[tid]
+
+        smoothed = [
+            int(alpha * prev[i] + (1 - alpha) * bbox[i])
+            for i in range(4)
+        ]
+
+        self.bbox_state[tid] = smoothed
+        return smoothed
+
+    def distance(self, p1, p2):
+        return np.hypot(p1[0] - p2[0], p1[1] - p2[1])
+
+    def db_worker(self):
+        """Thread 5 → Database worker (dedicated DB connection)"""
+        conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=60.0)
+        cur = conn.cursor()
+
+        # Optimize for concurrent access
+        cur.execute("PRAGMA journal_mode=WAL;")
+        cur.execute("PRAGMA synchronous=NORMAL;")
+        cur.execute("PRAGMA temp_store=MEMORY;")
+        cur.execute("PRAGMA cache_size=20000;")
+        cur.execute("PRAGMA mmap_size=536870912;")
+        cur.execute("PRAGMA busy_timeout=10000;")
+
+        face_batch = []
+        last_flush = time.time()
+
+        while not self.shutdown:
+            try:
+                try:
+                    item = self.face_queue.get_nowait()
+                except:
+                    item = None
+
+                if item:
+                    # Unpack 7 fields: pid, face, embedding, date, time_str, video, capture_time
+                    pid, face, embedding, date_str, time_str, video, capture_time = item
+
+                    # Measure DB latency
+                    db_latency = time.time() - capture_time
+                    self.db_latency_sum += db_latency
+                    self.db_latency_max = max(self.db_latency_max, db_latency)
+                    self.total_db_latency += db_latency
+                    self.total_db_samples += 1
+
+                    # Check if this is a special visit entry marker
+                    if isinstance(video, str) and video.startswith("VISIT:"):
+                        visit_data = video.split(":")
+                        if len(visit_data) == 3:
+                            visit_id = visit_data[1]
+                            visit_pid = visit_data[2]
+                            # Get gender for visit
+                            gender = "unknown"
+                            if visit_pid in self.pid_demographics:
+                                gender = self.pid_demographics[visit_pid][0]
+                            try:
+                                cur.execute("""
+                                    INSERT OR IGNORE INTO visits (visit_id, pid, entry_time, video, gender)
+                                    VALUES (?, ?, ?, ?, ?)
+                                """, (
+                                    visit_id,
+                                    visit_pid,
+                                    time_str,
+                                    self.video_name,
+                                    gender
+                                ))
+                                conn.commit()
+                            except sqlite3.OperationalError as e:
+                                if "database is locked" in str(e):
+                                    time.sleep(0.2)
+                                else:
+                                    print("Visit insert error:", e)
+                            except sqlite3.IntegrityError as e:
+                                if "UNIQUE constraint failed" in str(e):
+                                    print(f"Visit {visit_id} already exists, skipping...")
+                                else:
+                                    print("Visit insert integrity error:", e)
+                    else:
+                        # Add to face batch for batch insert
+                        face_batch.append((pid, face, embedding, date_str, time_str, video))
+
+                # Batch insert for better performance
+                if len(face_batch) >= 20:
+                    try:
+                        cur.executemany("""
+                            INSERT OR IGNORE INTO faces
+                            (pid, face, embedding, date, time, video)
+                            VALUES (?, ?, ?, ?, ?, ?)
+                        """, face_batch)
+                        conn.commit()
+                        face_batch.clear()
+                    except sqlite3.OperationalError as e:
+                        if "database is locked" in str(e):
+                            time.sleep(0.2)
+                        else:
+                            print("DB WORKER ERROR:", e)
+                    except sqlite3.IntegrityError as e:
+                        print("Face insert integrity error (ignored):", e)
+
+                # Time-based flush with retry logic
+                if time.time() - last_flush > 3.0:
+                    if face_batch:
+                        try:
+                            cur.executemany("""
+                                INSERT OR IGNORE INTO faces
+                                (pid, face, embedding, date, time, video)
+                                VALUES (?, ?, ?, ?, ?, ?)
+                            """, face_batch)
+                            conn.commit()
+                            face_batch.clear()
+                        except sqlite3.OperationalError as e:
+                            if "database is locked" in str(e):
+                                time.sleep(0.2)
+                            else:
+                                print("DB WORKER ERROR:", e)
+                        except sqlite3.IntegrityError as e:
+                            print("Face insert integrity error (ignored):", e)
+
+                    last_flush = time.time()
+
+                time.sleep(0.1)
+
+            except Exception as e:
+                print("DB WORKER ERROR (non-critical):", e)
+                time.sleep(0.2)
+
+        self.shutdown = True
+        time.sleep(2.0)
+        conn.close()
+
+    def handle_entry(self, pid):
+        if pid in self.active_visits:
+            return
+
+        visit_id = f"V{self.next_visit_id}"
+        self.next_visit_id += 1
+
+        self.active_visits[pid] = visit_id
+        self.visit_start_time[pid] = datetime.now()
+        self.visit_zones[visit_id] = {}
+        self.zone_dwell[visit_id] = {}
+
+        # 🔒 DEMOGRAPHIC LOCKING - ONLY at entry gate
+        # Only lock demographics if not already locked and we have embedding
+        if pid not in self.pid_demographics and pid in self.pid_embeddings:
+            # Try to get latest face image for demographic classification
+            face_img = self.latest_face_image.get(pid)
+            
+            gender = "unknown"
+            age_group = "unknown"
+            
+            if face_img is not None and face_img.size > 0:
+                # Classify gender from face
+                gender = self.classify_gender(face_img)
+                # Classify age from face
+                age_group = self.classify_age(face_img)
+            
+            # Lock demographics
+            self.pid_demographics[pid] = (gender, age_group)
+            self.pid_state[pid] = "DEMO_LOCKED"
+            print(f"🔒 DEMOGRAPHICS LOCKED for PID {pid}: {gender}, {age_group}")
+
+        try:
+            now = datetime.now()
+            capture_time = time.time()
+            try:
+                self.face_queue.put_nowait((
+                    pid,
+                    None,
+                    None,
+                    now.strftime("%Y-%m-%d"),
+                    now.strftime("%H:%M:%S"),
+                    f"VISIT:{visit_id}:{pid}",
+                    capture_time
+                ))
+            except:
+                pass
+        except Exception as e:
+            print("Visit insert error:", e)
+
+    def handle_zone(self, pid, zone_name, currently_inside):
+        if pid not in self.active_visits:
+            return
+
+        visit_id = self.active_visits[pid]
+        now = time.time()
+
+        if zone_name not in self.visit_zones[visit_id]:
+            if currently_inside:
+                self.visit_zones[visit_id][zone_name] = {
+                    "enter_time": now,
+                    "inside": True
+                }
+            return
+
+        zone_state = self.visit_zones[visit_id][zone_name]
+        previously_inside = zone_state["inside"]
+
+        if currently_inside and not previously_inside:
+            zone_state["enter_time"] = now
+            zone_state["inside"] = True
+        elif not currently_inside and previously_inside:
+            dwell = now - zone_state["enter_time"]
+            zone_state["inside"] = False
+
+            # Get gender from demographics
+            gender = "unknown"
+            if pid in self.pid_demographics:
+                gender = self.pid_demographics[pid][0]
+
+            try:
+                conn = sqlite3.connect(DB_PATH)
+                cur = conn.cursor()
+                cur.execute("""
+                    INSERT INTO zone_events
+                    (visit_id, zone, dwell_time, gender)
+                    VALUES (?, ?, ?, ?)
+                """, (
+                    visit_id,
+                    zone_name,
+                    round(dwell, 2),
+                    gender
+                ))
+                conn.commit()
+                conn.close()
+            except Exception as e:
+                print("Zone exit insert error:", e)
+
+    def billing_validate(self, pid, embedding):
+        if pid not in self.active_visits:
+            return pid
+
+        visit_id = self.active_visits[pid]
+
+        matched_pid = self.match_face(embedding)
+
+        if matched_pid is None:
+            return pid
+
+        if matched_pid == pid:
+            return pid
+
+        print(f"⚠️ PID CORRECTION: {pid} → {matched_pid}")
+
+        old_pid = pid
+        new_pid = matched_pid
+
+        self.active_visits[new_pid] = visit_id
+        del self.active_visits[old_pid]
+
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            cur = conn.cursor()
+            cur.execute("""
+                UPDATE visits
+                SET pid = ?
+                WHERE visit_id = ?
+            """, (new_pid, visit_id))
+
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print("Correction DB error:", e)
+
+        return new_pid
+
+    def close_visit(self, pid):
+        if pid not in self.active_visits:
+            return
+
+        visit_id = self.active_visits[pid]
+
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            cur = conn.cursor()
+            cur.execute("""
+                UPDATE visits
+                SET exit_time = ?
+                WHERE visit_id = ?
+            """, (
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                visit_id
+            ))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print("Visit close error:", e)
+
+        del self.active_visits[pid]
+
+    def run(self):
+        """Main execution loop - UI display only"""
+        while True:
+            current_time = time.time()
+            if current_time - self.fps_start_time >= 1.0:
+                self.current_fps = self.fps_frame_count / (current_time - self.fps_start_time)
+                self.fps_frame_count = 0
+                self.fps_start_time = current_time
+
+            if hasattr(self, '_last_frame') and self._last_frame is not None:
+                display_frame = self._last_frame.copy()
+            else:
+                display_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+                cv2.putText(
+                    display_frame,
+                    "WAITING FOR PROCESSING...",
+                    (50, 240),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1.0,
+                    (0, 255, 255),
+                    3
+                )
+
+            cv2.putText(
+                display_frame,
+                f"FPS: {self.current_fps:.1f}",
+                (20, 100),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 255, 255),
+                2
+            )
+
+            cv2.putText(
+                display_frame,
+                f"Total: {self.total_frames}",
+                (20, 130),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (255, 255, 255),
+                2
+            )
+
+            # cv2.putText(
+            #     display_frame,
+            #     f"Capture Drops: {self.capture_drops}",
+            #     (20, 160),
+            #     cv2.FONT_HERSHEY_SIMPLEX,
+            #     0.7,
+            #     (0, 0, 255),
+            #     2
+            # )
+
+            # drop_rate = (self.capture_drops / self.capture_count * 100) if self.capture_count > 0 else 0
+            # cv2.putText(
+            #     display_frame,
+            #     f"Drop Rate: {drop_rate:.1f}%",
+            #     (20, 190),
+            #     cv2.FONT_HERSHEY_SIMPLEX,
+            #     0.7,
+            #     (0, 0, 255),
+            #     2
+            # )
+
+            cv2.imshow("Retail Analytics", display_frame)
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                self.shutdown = True
+                if hasattr(self, 'multi_capture'):
+                    self.multi_capture.stop()
+                time.sleep(1.5)
+                break
+
+            time.sleep(0.01)
+
+    def capture_loop(self):
+        """Thread 1 → Capture (constant rate)"""
+        TARGET_FPS = 25
+        frame_interval = 1.0 / TARGET_FPS
+
+        while not self.shutdown:
+            start = time.time()
+            
+            for _ in range(2):
+                self.cap.grab()
+            
+            ret, frame = self.cap.read()
+            now = time.time()
+
+            if not ret:
+                self.capture_failures += 1
+                continue
+
+            self.capture_count += 1
+            self.capture_second += 1
+            self.total_frames += 1
+
+            try:
+                self.frame_queue.put_nowait((frame, now))
+            except:
+                self.capture_drops += 1
+                self.second_dropped += 1
+
+            elapsed = time.time() - start
+            sleep_time = frame_interval - elapsed
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+
+    def yolo_loop(self):
+        """Thread 2 → YOLO Detection (OpenVINO optimized)"""
+        while not self.shutdown:
+            try:
+                frame, capture_time = self.frame_queue.get(timeout=1)
+            except:
+                continue
+
+            # Track capture FPS
+            self.second_capture_count += 1
+
+            # ===============================
+            # 1️⃣ YOLO DETECTION (OpenVINO optimized)
+            # ===============================
+            if OPENVINO_AVAILABLE and hasattr(self, 'infer_queue'):
+                # Pass ratio, dw, dh through async user_data to avoid race condition
+                blob, ratio, dw, dh = self.preprocess(frame)
+                yolo_start = time.time()
+                self.infer_queue.start_async(blob, (frame, capture_time, ratio, dw, dh, yolo_start))
+            else:
+                # Fallback to PyTorch YOLO
+                results = self.detector.predict(
+                    frame,
+                    conf=0.2,
+                    imgsz=320,
+                    device="cpu",
+                    verbose=False
+                )[0]
+
+                # ===============================
+                # 2️⃣ BUILD DETECTIONS
+                # ===============================
+                dets = []
+                frame_h = frame.shape[0]
+
+                for b in results.boxes:
+                    conf = float(b.conf[0])
+                    cls = int(b.cls[0])
+
+                    if cls != 0:
+                        continue
+
+                    x1, y1, x2, y2 = map(int, b.xyxy[0])
+                    h = y2 - y1
+                    if h < 0.08 * frame_h:
+                        continue
+
+                    dets.append([x1, y1, x2, y2, conf, cls])
+
+                try:
+                    self.detection_queue.put_nowait((frame, dets, capture_time))
+                except:
+                    pass
+
+    def print_metrics(self):
+        """Print production-grade metrics block"""
+        current_time = time.time()
+        
+        capture_fps = self.second_capture_count
+        pipeline_fps = self.second_pipeline_count
+        
+        frame_queue_fill = self.frame_queue.qsize() / self.frame_queue.maxsize if self.frame_queue.maxsize > 0 else 0
+        detection_queue_fill = self.detection_queue.qsize() / self.detection_queue.maxsize if self.detection_queue.maxsize > 0 else 0
+        face_queue_in_fill = self.face_queue_in.qsize() / self.face_queue_in.maxsize if self.face_queue_in.maxsize > 0 else 0
+        face_queue_out_fill = self.face_queue_out.qsize() / self.face_queue_out.maxsize if self.face_queue_out.maxsize > 0 else 0
+        db_queue_fill = self.face_queue.qsize() / self.face_queue.maxsize if self.face_queue.maxsize > 0 else 0
+        
+        # YOLO latency
+        avg_yolo = (self.yolo_latency_sum / max(1, self.total_yolo_samples)) * 1000
+        max_yolo = self.yolo_latency_max * 1000
+        
+        # Face detection latency
+        avg_face_det = (self.face_det_latency_sum / max(1, self.total_face_det_samples)) * 1000
+        max_face_det = self.face_det_latency_max * 1000
+        
+        # Face reidentification latency
+        avg_face_reid = (self.face_reid_latency_sum / max(1, self.total_face_reid_samples)) * 1000
+        max_face_reid = self.face_reid_latency_max * 1000
+        
+        avg_tracker_lat = (self.tracker_latency_sum / self.second_pipeline_count * 1000) if self.second_pipeline_count > 0 else 0
+        max_tracker_lat = self.tracker_latency_max * 1000
+        avg_full_lat = (self.full_latency_sum / self.second_pipeline_count * 1000) if self.second_pipeline_count > 0 else 0
+        max_full_lat = self.full_latency_max * 1000
+        # Face latency uses actual face sample count, not pipeline count
+        if self.total_face_samples > 0:
+            avg_face_lat = (self.face_latency_sum / self.total_face_samples) * 1000
+        else:
+            avg_face_lat = 0
+        max_face_lat = self.face_latency_max * 1000
+        
+        drop_rate = (self.capture_drops / max(1, self.capture_count)) * 100
+        processing_eff = (pipeline_fps / max(1, capture_fps)) * 100 if capture_fps > 0 else 0
+        
+        print(f"\n----------------------------------------------------")
+        print(f"📊 PIPELINE METRICS")
+        print(f"----------------------------------------------------")
+        print(f"Capture FPS: {capture_fps}")
+        print(f"Pipeline FPS: {pipeline_fps}")
+        print(f"Frame Queue Fill: {frame_queue_fill:.2%}")
+        print(f"Detection Queue Fill: {detection_queue_fill:.2%}")
+        print(f"Face Queue Fill: {face_queue_in_fill:.2%}")
+        print(f"DB Queue Fill: {db_queue_fill:.2%}")
+        print(f"Avg YOLO Latency: {avg_yolo:.1f} ms")
+        print(f"Max YOLO Latency: {max_yolo:.1f} ms")
+        print(f"Avg Face Det Latency: {avg_face_det:.1f} ms")
+        print(f"Max Face Det Latency: {max_face_det:.1f} ms")
+        print(f"Avg Face ReID Latency: {avg_face_reid:.1f} ms")
+        print(f"Max Face ReID Latency: {max_face_reid:.1f} ms")
+        print(f"Avg Tracker Latency: {avg_tracker_lat:.1f} ms")
+        print(f"Max Tracker Latency: {max_tracker_lat:.1f} ms")
+        print(f"Avg Full Pipeline Latency: {avg_full_lat:.1f} ms")
+        print(f"Max Full Pipeline Latency: {max_full_lat:.1f} ms")
+        print(f"Avg Face Latency: {avg_face_lat:.1f} ms")
+        print(f"Max Face Latency: {max_face_lat:.1f} ms")
+        print(f"Drop Rate: {drop_rate:.1f}%")
+        print(f"Processing Efficiency: {processing_eff:.1f}%")
+        print(f"----------------------------------------------------")
+
+    def tracking_loop(self):
+        """Thread 3 → Tracking"""
+        while not self.shutdown:
+            try:
+                frame, dets, capture_time = self.detection_queue.get(timeout=1)
+            except:
+                continue
+
+            # ===============================
+            # 3️⃣ BYTE TRACKING ONLY
+            # ===============================
+            tracker_latency = 0.0  # Default if no tracking
+            
+            if len(dets) > 0:
+                valid_dets = []
+                for det in dets:
+                    if len(det) < 6:
+                        continue
+
+                    x1, y1, x2, y2, conf, cls = det
+
+                    if x1 < 0 or y1 < 0 or x2 <= x1 or y2 <= y1:
+                        continue
+
+                    w = x2 - x1
+                    h = y2 - y1
+                    if w < 10 or h < 10:
+                        continue
+
+                    if conf < 0.2:
+                        continue
+
+                    valid_dets.append(det)
+
+                if len(valid_dets) > 0:
+                    # Measure pure tracker compute time
+                    tracker_compute_start = time.time()
+                    try:
+                        tracks_raw = self.tracker.update(
+                            np.array(valid_dets, dtype=np.float32),
+                            frame
+                        )
+                    except Exception as e:
+                        print(f"ByteTrack error: {e}")
+                        tracks_raw = []
+                    tracker_latency = time.time() - tracker_compute_start
+                else:
+                    tracks_raw = []
+            else:
+                tracks_raw = []
+            
+            self.handle_tracks(frame, tracks_raw, capture_time)
+
+            # Full pipeline latency (after handle_tracks completes)
+            full_pipeline_latency = time.time() - capture_time
+            
+            # Update metrics
+            self.process_count += 1
+            self.process_second += 1
+            self.frame_count += 1
+            self.second_processed += 1
+            self.second_pipeline_count += 1
+            self.fps_frame_count += 1
+            
+            # Per-second latency tracking
+            self.tracker_latency_sum += tracker_latency
+            self.tracker_latency_max = max(self.tracker_latency_max, tracker_latency)
+            self.full_latency_sum += full_pipeline_latency
+            self.full_latency_max = max(self.full_latency_max, full_pipeline_latency)
+            
+            # Cumulative latency tracking
+            self.total_tracker_latency += tracker_latency
+            self.total_full_latency += full_pipeline_latency
+            self.total_tracker_samples += 1
+            self.total_full_samples += 1
+
+            self.processed_frames += 1
+
+            self._last_frame = frame
+
+            current_time = time.time()
+            if current_time - self.last_stats_time >= 1.0:
+                self.print_metrics()
+                
+                # Reset per-second counters
+                self.second_capture_count = 0
+                self.second_pipeline_count = 0
+                self.tracker_latency_sum = 0.0
+                self.tracker_latency_max = 0.0
+                self.full_latency_sum = 0.0
+                self.full_latency_max = 0.0
+                self.face_latency_sum = 0.0
+                self.face_latency_max = 0.0
+                self.db_latency_sum = 0.0
+                self.db_latency_max = 0.0
+                self.yolo_latency_sum = 0.0
+                self.yolo_latency_max = 0.0
+                self.face_det_latency_sum = 0.0
+                self.face_det_latency_max = 0.0
+                self.face_reid_latency_sum = 0.0
+                self.face_reid_latency_max = 0.0
+                self.capture_second = 0
+                self.process_second = 0
+                self.second_processed = 0
+                self.second_dropped = 0
+                self.latency_second = 0
+                self.max_latency = 0
+                self.last_stats_time = current_time
+
+    def face_loop(self):
+        """Thread 4 → Face Processing (OpenVINO)"""
+        while not self.shutdown:
+            try:
+                frame, bbox, tid, capture_time = self.face_queue_in.get(timeout=1)
+            except:
+                continue
+
+            face_emb, face_img = self.get_face_openvino(frame, bbox)
+
+            # Measure face latency
+            face_latency = time.time() - capture_time
+            
+            if face_emb is not None and face_img is not None:
+                try:
+                    self.face_queue_out.put_nowait((tid, face_emb, face_img))
+                except:
+                    pass
+
+                success, buffer = cv2.imencode(".png", face_img)
+                if success:
+                    now = datetime.now()
+                    try:
+                        self.face_queue.put_nowait((
+                            0,
+                            buffer.tobytes(),
+                            face_emb.astype(np.float32).tobytes(),
+                            now.strftime("%Y-%m-%d"),
+                            now.strftime("%H:%M:%S"),
+                            self.video_name,
+                            capture_time
+                        ))
+                    except:
+                        pass
+                
+                # Update face latency metrics
+                self.face_latency_sum += face_latency
+                self.face_latency_max = max(self.face_latency_max, face_latency)
+                self.total_face_latency += face_latency
+                self.total_face_samples += 1
+            else:
+                try:
+                    self.face_queue_out.put_nowait((tid, None, None))
+                except:
+                    pass
+
+
+def run():
+    print("🔥 THIS FILE IS RUNNING")
+    RetailAnalytics().run()
