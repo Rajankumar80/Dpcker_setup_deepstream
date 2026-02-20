@@ -1,0 +1,15 @@
+AsyncInferQueue still running previous job
+
+CPU core migration
+
+Python GIL interference
+
+Garbage collection
+
+OpenVINO thread wake-up delay
+
+Thermal throttling
+
+Context switching
+
+This line confirms that:
