@@ -1,0 +1,322 @@
+
+import gi
+gi.require_version("Gst", "1.0")
+from gi.repository import Gst
+import cv2
+import numpy as np
+import threading
+import queue
+import time
+import signal
+import sys
+from openvino import Core, AsyncInferQueue
+
+CONFIG = {
+    "model": {
+        "path": "/home/shekar/video_pipeline/yolov8n_openvino_model/yolov8n.xml",
+        "device": "CPU"
+    },
+    "thresholds": {
+        "conf": 0.30,
+        "nms": 0.45
+    },
+    "input_size": 640,
+    "streams": [
+        "rtsp://10.64.36.13:554/rtsp/streaming?channel=01&subtype=1",
+        "rtsp://10.64.36.14:554/rtsp/streaming?channel=01&subtype=1"
+    ]
+}
+
+CLASSES = ["person","bicycle","car","motorcycle","airplane","bus","train","truck","boat",
+"traffic light","fire hydrant","stop sign","parking meter","bench","bird","cat","dog",
+"horse","sheep","cow","elephant","bear","zebra","giraffe","backpack","umbrella",
+"handbag","tie","suitcase","frisbee","skis","snowboard","sports ball","kite",
+"baseball bat","baseball glove","skateboard","surfboard","tennis racket","bottle",
+"wine glass","cup","fork","knife","spoon","bowl","banana","apple","sandwich",
+"orange","broccoli","carrot","hot dog","pizza","donut","cake","chair","couch",
+"potted plant","bed","dining table","toilet","tv","laptop","mouse","remote",
+"keyboard","cell phone","microwave","oven","toaster","sink","refrigerator","book",
+"clock","vase","scissors","teddy bear","hair drier","toothbrush"]
+
+Gst.init(None)
+
+
+# ================= MODEL =================
+
+class YOLOv8Model:
+    def __init__(self, cfg, num_streams):
+        self.conf = CONFIG["thresholds"]["conf"]
+        self.nms = CONFIG["thresholds"]["nms"]
+        self.core = Core()
+        model = self.core.read_model(cfg["path"])
+        self.compiled = self.core.compile_model(model, cfg["device"])
+        self.infer_queue = AsyncInferQueue(self.compiled, jobs=num_streams)
+
+    def preprocess(self, frame):
+        img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        blob = img.transpose(2,0,1)[None].astype(np.float32)
+        blob /= 255.0
+        return blob
+
+    def postprocess(self, infer_result):
+        output = infer_result.get_output_tensor().data
+        output = np.squeeze(output).T
+
+        scores_max = np.max(output[:, 4:], axis=1)
+        mask = scores_max > self.conf
+        output = output[mask]
+
+        boxes, scores, class_ids = [], [], []
+
+        for row in output:
+            probs = row[4:]
+            cid = np.argmax(probs)
+            score = probs[cid]
+
+            x = int(row[0] - row[2] / 2)
+            y = int(row[1] - row[3] / 2)
+            w = int(row[2])
+            h = int(row[3])
+
+            boxes.append([x, y, w, h])
+            scores.append(float(score))
+            class_ids.append(cid)
+
+        if not boxes:
+            return []
+
+        idx = cv2.dnn.NMSBoxes(boxes, scores, self.conf, self.nms)
+        return [(boxes[i], scores[i], class_ids[i]) for i in idx.flatten()]
+
+
+# ================= BUSINESS =================
+
+class BusinessLogic:
+    def process(self, detections):
+        events = []
+        for _, _, cid in detections:
+            if CLASSES[cid] == "person":
+                events.append("PERSON_DETECTED")
+        return events
+
+
+# ================= OUTPUT =================
+
+class OutputHandler:
+    def draw(self, frame, detections):
+        for box, score, cid in detections:
+            x,y,w,h = box
+            label = f"{CLASSES[cid]} {score:.2f}"
+            color = (0,255,0) if CLASSES[cid]=="person" else (255,128,0)
+            cv2.rectangle(frame,(x,y),(x+w,y+h),color,2)
+            cv2.putText(frame,label,(x,y-5),
+                        cv2.FONT_HERSHEY_SIMPLEX,0.5,(255,255,0),1)
+
+
+# ================= CAMERA STREAM =================
+
+class CameraStream:
+    def __init__(self, cam_id, url, model, logic, output, display_queue):
+        self.cam_id = cam_id
+        self.url = url
+        self.model = model
+        self.logic = logic
+        self.output = output
+        self.display_queue = display_queue
+
+        self.frame_queue = queue.Queue(maxsize=2)
+        self.running = True
+        self.pipeline = None
+
+        self.last_frame_time = time.time()
+        self.stall_timeout = 3
+        self.reconnect_delay = 1
+
+        self.status = "CONNECTING"
+
+        threading.Thread(target=self.capture_loop, daemon=True).start()
+        threading.Thread(target=self.inference_loop, daemon=True).start()
+
+    def build_pipeline(self):
+        return Gst.parse_launch(
+            f'rtspsrc location="{self.url}" protocols=tcp latency=100 '
+            f'timeout=2000000 tcp-timeout=2000000 ! '
+            f'rtph265depay ! h265parse ! avdec_h265 ! '
+            f'videoconvert ! videoscale ! '
+            f'video/x-raw,width=640,height=640,format=BGR ! '
+            f'appsink name=sink emit-signals=true sync=false max-buffers=1 drop=true'
+        )
+
+    def create_status_frame(self, text):
+        frame = np.zeros((640,640,3), dtype=np.uint8)
+        cv2.putText(frame, text, (180,320),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1,
+                    (0,0,255), 2)
+        return frame
+
+    def on_sample(self, sink):
+        sample = sink.emit("pull-sample")
+        if not sample:
+            return Gst.FlowReturn.OK
+
+        buf = sample.get_buffer()
+        res, map_info = buf.map(Gst.MapFlags.READ)
+
+        if res:
+            self.status = "LIVE"
+            self.last_frame_time = time.time()
+
+            if not self.frame_queue.full() and self.running:
+                frame = np.frombuffer(
+                    map_info.data,
+                    dtype=np.uint8
+                ).reshape((640,640,3)).copy()
+                self.frame_queue.put_nowait(frame)
+
+            buf.unmap(map_info)
+
+        return Gst.FlowReturn.OK
+
+    def cleanup_pipeline(self):
+        if self.pipeline:
+            self.pipeline.set_state(Gst.State.NULL)
+            self.pipeline = None
+
+    def capture_loop(self):
+        while self.running:
+            try:
+                self.status = "CONNECTING"
+                self.pipeline = self.build_pipeline()
+                sink = self.pipeline.get_by_name("sink")
+                sink.connect("new-sample", self.on_sample)
+                self.pipeline.set_state(Gst.State.PLAYING)
+
+                bus = self.pipeline.get_bus()
+                self.last_frame_time = time.time()
+
+                while self.running:
+                    msg = bus.timed_pop_filtered(
+                        100 * Gst.MSECOND,
+                        Gst.MessageType.ERROR | Gst.MessageType.EOS
+                    )
+
+                    if msg:
+                        break
+
+                    if time.time() - self.last_frame_time > self.stall_timeout:
+                        break
+
+            except:
+                pass
+
+            self.status = "RECONNECTING"
+            self.cleanup_pipeline()
+
+            if not self.running:
+                break
+
+            time.sleep(self.reconnect_delay)
+            self.reconnect_delay = min(self.reconnect_delay + 1, 5)
+
+    def inference_loop(self):
+        def callback(infer_request, user_data):
+            if not self.running:
+                return
+
+            frame, cam_id = user_data
+            detections = self.model.postprocess(infer_request)
+            _ = self.logic.process(detections)
+            self.output.draw(frame, detections)
+
+            if not self.display_queue.full():
+                self.display_queue.put_nowait((cam_id, frame))
+
+        self.model.infer_queue.set_callback(callback)
+
+        while self.running:
+            try:
+                frame = self.frame_queue.get(timeout=1)
+                blob = self.model.preprocess(frame)
+                self.model.infer_queue.start_async(
+                    blob,
+                    (frame, self.cam_id)
+                )
+            except:
+                if self.status != "LIVE":
+                    frame = self.create_status_frame(
+                        "NO SIGNAL" if self.status=="CONNECTING"
+                        else "RECONNECTING..."
+                    )
+                    if not self.display_queue.full():
+                        self.display_queue.put_nowait((self.cam_id, frame))
+
+
+# ================= SYSTEM =================
+
+class SurveillanceSystem:
+    def __init__(self):
+        urls = CONFIG["streams"]
+        num_cameras = len(urls)
+
+        self.model = YOLOv8Model(CONFIG["model"], num_cameras)
+        self.logic = BusinessLogic()
+        self.output = OutputHandler()
+
+        self.display_queue = queue.Queue(maxsize=num_cameras * 2)
+        self.streams = [
+            CameraStream(i, url, self.model,
+                         self.logic, self.output,
+                         self.display_queue)
+            for i, url in enumerate(urls)
+        ]
+
+        self.latest_frames = {i: None for i in range(num_cameras)}
+
+        signal.signal(signal.SIGINT, self.shutdown_handler)
+        signal.signal(signal.SIGTERM, self.shutdown_handler)
+
+        self.display_loop()
+
+    def display_loop(self):
+        cv2.namedWindow("Surveillance", cv2.WINDOW_AUTOSIZE)
+
+        while True:
+            while not self.display_queue.empty():
+                cid, frame = self.display_queue.get_nowait()
+                self.latest_frames[cid] = frame
+
+            valid_frames = [
+                self.latest_frames[i]
+                for i in sorted(self.latest_frames.keys())
+                if self.latest_frames[i] is not None
+            ]
+
+            if valid_frames:
+                grid = np.hstack(valid_frames)
+                cv2.imshow("Surveillance", grid)
+
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q') or \
+               cv2.getWindowProperty("Surveillance",
+                                     cv2.WND_PROP_VISIBLE) < 1:
+                break
+
+        self.shutdown_handler()
+
+    def shutdown_handler(self, *args):
+        print("\n[INFO] Closing system safely...")
+
+        for s in self.streams:
+            s.running = False
+            s.cleanup_pipeline()
+
+        cv2.destroyAllWindows()
+        time.sleep(0.5)
+
+        print("[INFO] Cleanup complete. Exiting.")
+        sys.exit(0)
+
+
+if __name__ == "__main__":
+    SurveillanceSystem()
+ 
