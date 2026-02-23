@@ -1,0 +1,327 @@
+import gi
+gi.require_version("Gst", "1.0")
+from gi.repository import Gst
+import cv2
+import numpy as np
+import threading
+import queue
+import time
+import signal
+import sys
+from openvino import Core, AsyncInferQueue
+
+# --------------------------------------------------
+# CONFIG
+# --------------------------------------------------
+
+CONFIG = {
+    "model": {
+        "path": "/home/rajan/survillence/models/yolov8n.xml",
+        "device": "CPU"
+    },
+    "thresholds": {
+        "conf": 0.35,
+        "nms": 0.45
+    },
+    "input_size": 640,
+    "streams": [
+        "rtsp://10.64.36.13:554/rtsp/streaming?channel=01&subtype=1",
+        "rtsp://10.64.36.14:554/rtsp/streaming?channel=01&subtype=1",
+    ]
+}
+
+CLASSES = ["person"]
+
+Gst.init(None)
+
+# --------------------------------------------------
+# YOLOv8 INT8 MODEL
+# --------------------------------------------------
+
+class YOLOv8Model:
+
+    def __init__(self, cfg):
+
+        self.input_size = CONFIG["input_size"]
+        self.conf = CONFIG["thresholds"]["conf"]
+        self.nms = CONFIG["thresholds"]["nms"]
+
+        self.core = Core()
+        model = self.core.read_model(cfg["path"])
+
+        self.compiled = self.core.compile_model(
+            model,
+            cfg["device"],
+            {"PERFORMANCE_HINT": "LATENCY"}
+        )
+
+        print("✅ YOLOv8 INT8 OpenVINO model loaded")
+
+    def letterbox(self, img, new_shape=(640, 640), color=(114,114,114)):
+        shape = img.shape[:2]
+        r = min(new_shape[0] / shape[0], new_shape[1] / shape[1])
+
+        new_unpad = (int(round(shape[1] * r)), int(round(shape[0] * r)))
+        dw = new_shape[1] - new_unpad[0]
+        dh = new_shape[0] - new_unpad[1]
+
+        dw /= 2
+        dh /= 2
+
+        img = cv2.resize(img, new_unpad, interpolation=cv2.INTER_LINEAR)
+
+        top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
+        left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
+
+        img = cv2.copyMakeBorder(img, top, bottom, left, right,
+                                 cv2.BORDER_CONSTANT, value=color)
+
+        return img, r, dw, dh
+
+    def preprocess(self, frame):
+
+        img, ratio, dw, dh = self.letterbox(frame)
+
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        img = img.transpose(2, 0, 1)
+        img = np.expand_dims(img, axis=0)
+        img = img.astype(np.float32) / 255.0
+
+        return img, ratio, dw, dh
+
+    def postprocess(self, output, frame_shape, ratio, dw, dh):
+
+        output = np.squeeze(output)
+
+        if len(output.shape) == 3:
+            output = output[0]
+
+        output = output.T
+
+        h, w = frame_shape[:2]
+        raw = []
+
+        for row in output:
+            cx, cy, bw, bh = row[:4]
+            class_scores = row[4:]
+
+            cid = np.argmax(class_scores)
+            conf = float(class_scores[cid])
+
+            if cid != 0:
+                continue
+            if conf < 0.15:
+                continue
+
+            x1 = cx - bw / 2
+            y1 = cy - bh / 2
+            x2 = cx + bw / 2
+            y2 = cy + bh / 2
+
+            x1 = (x1 - dw) / ratio
+            y1 = (y1 - dh) / ratio
+            x2 = (x2 - dw) / ratio
+            y2 = (y2 - dh) / ratio
+
+            x1 = int(max(0, min(w, x1)))
+            y1 = int(max(0, min(h, y1)))
+            x2 = int(max(0, min(w, x2)))
+            y2 = int(max(0, min(h, y2)))
+
+            raw.append([x1, y1, x2, y2, conf, cid])
+
+        if not raw:
+            return []
+
+        boxes = [[d[0], d[1], d[2]-d[0], d[3]-d[1]] for d in raw]
+        scores = [d[4] for d in raw]
+
+        indices = cv2.dnn.NMSBoxes(boxes, scores, 0.15, 0.5)
+
+        final = []
+
+        if len(indices) > 0:
+            for i in indices.flatten():
+                x1,y1,x2,y2,conf,cid = raw[i]
+                final.append(([x1,y1,x2-x1,y2-y1], conf, cid))
+
+        return final
+
+
+# --------------------------------------------------
+# CAMERA STREAM
+# --------------------------------------------------
+
+class CameraStream:
+
+    def __init__(self, cam_id, url, model, display_queue):
+
+        self.cam_id = cam_id
+        self.url = url
+        self.model = model
+        self.display_queue = display_queue
+
+        self.frame_queue = queue.Queue(maxsize=2)
+        self.running = True
+        self.pipeline = None
+
+        # 🔥 Each camera gets its own infer queue
+        self.infer_queue = AsyncInferQueue(self.model.compiled, jobs=2)
+        self.infer_queue.set_callback(self.callback)
+
+        threading.Thread(target=self.capture_loop, daemon=True).start()
+        threading.Thread(target=self.inference_loop, daemon=True).start()
+
+    def build_pipeline(self):
+        return Gst.parse_launch(
+            f'rtspsrc location="{self.url}" protocols=tcp latency=200 ! '
+            f'rtph265depay ! h265parse ! avdec_h265 ! '
+            f'videoconvert ! videoscale ! '
+            f'video/x-raw,width=640,height=360,format=BGR ! '
+            f'appsink name=sink emit-signals=true sync=false max-buffers=1 drop=true'
+        )
+
+    def on_sample(self, sink):
+
+        sample = sink.emit("pull-sample")
+        if not sample:
+            return Gst.FlowReturn.OK
+
+        buf = sample.get_buffer()
+        res, map_info = buf.map(Gst.MapFlags.READ)
+
+        if res:
+            frame = np.frombuffer(map_info.data, dtype=np.uint8)
+            frame = frame.reshape((360,640,3)).copy()
+            buf.unmap(map_info)
+
+            if not self.frame_queue.full():
+                self.frame_queue.put_nowait(frame)
+
+        return Gst.FlowReturn.OK
+
+    def capture_loop(self):
+
+        while self.running:
+
+            self.pipeline = self.build_pipeline()
+            sink = self.pipeline.get_by_name("sink")
+            sink.connect("new-sample", self.on_sample)
+            self.pipeline.set_state(Gst.State.PLAYING)
+
+            bus = self.pipeline.get_bus()
+
+            while self.running:
+                msg = bus.timed_pop(Gst.SECOND)
+                if msg and msg.type == Gst.MessageType.ERROR:
+                    break
+
+            self.pipeline.set_state(Gst.State.NULL)
+            time.sleep(1)
+
+    def callback(self, infer_request, user_data):
+
+        frame, ratio, dw, dh = user_data
+
+        output = infer_request.get_output_tensor().data.copy()
+
+        detections = self.model.postprocess(
+            output,
+            frame.shape,
+            ratio,
+            dw,
+            dh
+        )
+
+        for box, conf, cid in detections:
+            x,y,w,h = box
+            cv2.rectangle(frame,(x,y),(x+w,y+h),(0,255,0),2)
+            cv2.putText(frame,f"{CLASSES[cid]} {conf:.2f}",
+                        (x,y-5),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5,(255,255,0),1)
+
+        if not self.display_queue.full():
+            self.display_queue.put_nowait((self.cam_id, frame))
+
+    def inference_loop(self):
+
+        while self.running:
+
+            try:
+                frame = self.frame_queue.get(timeout=1)
+
+                blob, ratio, dw, dh = self.model.preprocess(frame)
+
+                self.infer_queue.start_async(
+                    blob,
+                    (frame, ratio, dw, dh)
+                )
+
+            except:
+                continue
+
+
+# --------------------------------------------------
+# SYSTEM
+# --------------------------------------------------
+
+class SurveillanceSystem:
+
+    def __init__(self):
+
+        urls = CONFIG["streams"]
+
+        self.model = YOLOv8Model(CONFIG["model"])
+
+        self.display_queue = queue.Queue(maxsize=len(urls)*2)
+
+        self.streams = [
+            CameraStream(i, url, self.model, self.display_queue)
+            for i, url in enumerate(urls)
+        ]
+
+        self.latest = {i:None for i in range(len(urls))}
+
+        signal.signal(signal.SIGINT, self.shutdown)
+        signal.signal(signal.SIGTERM, self.shutdown)
+
+        self.display_loop()
+
+    def display_loop(self):
+
+        cv2.namedWindow("Surveillance", cv2.WINDOW_AUTOSIZE)
+
+        while True:
+
+            while not self.display_queue.empty():
+                cid, frame = self.display_queue.get_nowait()
+                self.latest[cid] = frame
+
+            valid = [f for f in self.latest.values() if f is not None]
+
+            if valid:
+                grid = np.hstack(valid) if len(valid) > 1 else valid[0]
+                cv2.imshow("Surveillance", grid)
+
+            if cv2.waitKey(1) == ord("q"):
+                break
+
+        self.shutdown()
+
+    def shutdown(self, *args):
+
+        print("\n[INFO] Closing system safely...")
+
+        for s in self.streams:
+            s.running = False
+            if s.pipeline:
+                s.pipeline.set_state(Gst.State.NULL)
+
+        cv2.destroyAllWindows()
+        time.sleep(0.5)
+        sys.exit(0)
+
+
+if __name__ == "__main__":
+    SurveillanceSystem()
